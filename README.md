@@ -1,5 +1,5 @@
 # cervical-cancer-classification-colposcopy
-You need to run it in tensorflow and keras with TPU environment,
+#You need to run it in tensorflow and keras with TPU environment
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, callbacks
 from tensorflow.keras.preprocessing import image_dataset_from_directory
