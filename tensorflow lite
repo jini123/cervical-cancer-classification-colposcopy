@@ -1,0 +1,81 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+import numpy as np
+import time
+from sklearn.metrics import cohen_kappa_score
+
+# -----------------------------
+# Reliability Metrics
+# -----------------------------
+def dice_similarity_coefficient(y_true, y_pred):
+    intersection = np.sum(y_true * y_pred)
+    return (2. * intersection) / (np.sum(y_true) + np.sum(y_pred))
+
+def intersection_over_union(y_true, y_pred):
+    intersection = np.sum(y_true * y_pred)
+    union = np.sum(y_true) + np.sum(y_pred) - intersection
+    return intersection / union
+
+def compute_kappa(y_true, y_pred):
+    return cohen_kappa_score(y_true.flatten(), y_pred.flatten())
+
+# -----------------------------
+# Model Definition with SE Blocks
+# -----------------------------
+def se_block(input_tensor, channels, reduction=16):
+    se = layers.GlobalAveragePooling2D()(input_tensor)
+    se = layers.Dense(channels // reduction, activation='relu')(se)
+    se = layers.Dense(channels, activation='sigmoid')(se)
+    se = layers.Reshape((1, 1, channels))(se)
+    return layers.Multiply()([input_tensor, se])
+
+def build_deep_model(input_shape=(224, 224, 3), num_classes=3):
+    inputs = layers.Input(shape=input_shape)
+    
+    def conv_block(x, filters):
+        shortcut = x
+        x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
+        shortcut = layers.Conv2D(filters, (1, 1), padding='same')(shortcut)
+        x = layers.Add()([x, shortcut])
+        x = layers.MaxPooling2D((2, 2))(x)
+        return se_block(x, channels=filters)
+    
+    x = conv_block(inputs, 64)
+    x = conv_block(x, 128)
+    x = conv_block(x, 256)
+    x = conv_block(x, 512)
+    x = conv_block(x, 512)
+    
+    x = layers.Flatten()(x)
+    x = layers.Dense(4096, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(4096, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    
+    return models.Model(inputs, outputs)
+
+# -----------------------------
+# TensorFlow Lite Conversion
+# -----------------------------
+def convert_to_tflite(model, quantized=False):
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    if quantized:
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    
+    file_name = "model_quant.tflite" if quantized else "model.tflite"
+    with open(file_name, "wb") as f:
+        f.write(tflite_model)
+    print(f"✅ TFLite Model Saved as {file_name}")
+
+# -----------------------------
+# Final Execution
+# -----------------------------
+model = build_deep_model()
+model.compile(optimizer=optimizers.Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Convert to TFLite
+convert_to_tflite(model, quantized=True)
