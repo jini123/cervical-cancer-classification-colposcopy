@@ -1,60 +1,42 @@
-import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-from tensorflow.keras.preprocessing import image_dataset_from_directory
+# =============================================
+# Cervical Lesion Grading using SE-Residual CNN
+# =============================================
+# Author: Your Name
+# GitHub: your_github_link
+# Description: Deep learning pipeline for CIN1-CIN3 cervical lesion classification
+# =============================================
+
+import os
+import random
+import time
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import time
-import random
-import pandas as pd
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
-from sklearn.metrics import precision_recall_fscore_support, cohen_kappa_score
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.decomposition import PCA
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, cohen_kappa_score
+import cv2
+import shap
+import gradcam
 
 # -----------------------------
-# TPU Setup
+# TPU or GPU Strategy Setup
 # -----------------------------
 try:
     tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
-    print("Running on TPU:", tpu.master())
     tf.config.experimental_connect_to_cluster(tpu)
     tf.tpu.experimental_initialize_tpu_system(tpu)
     strategy = tf.distribute.TPUStrategy(tpu)
-except ValueError:
-    print("TPU Not Found. Running on CPU")
+    print("Running on TPU")
+except:
     strategy = tf.distribute.get_strategy()
+    print("Running on CPU/GPU")
 
 # -----------------------------
-# Reliability Metrics
-# -----------------------------
-def dice_similarity_coefficient(y_true, y_pred):
-    intersection = np.sum(y_true * y_pred)
-    return (2. * intersection) / (np.sum(y_true) + np.sum(y_pred))
-
-def intersection_over_union(y_true, y_pred):
-    intersection = np.sum(y_true * y_pred)
-    union = np.sum(y_true) + np.sum(y_pred) - intersection
-    return intersection / union
-
-def compute_kappa(y_true, y_pred):
-    return cohen_kappa_score(y_true.flatten(), y_pred.flatten())
-
-# -----------------------------
-# FLOPs Computation
-# -----------------------------
-def compute_flops(model):
-    concrete_func = tf.function(lambda x: model(x))
-    concrete_func = concrete_func.get_concrete_function(
-        tf.TensorSpec([1] + list(model.input_shape[1:]), model.input.dtype)
-    )
-    
-    options = tf.profiler.experimental.ProfilerOptions()
-    tf.profiler.experimental.start('logdir', options)
-    flops = tf.profiler.experimental.stop()
-    
-    return flops.total_float_ops / 1e9  # Convert to GFLOPs
-
-# -----------------------------
-# Model Definition with SE Blocks
+# SE Block
 # -----------------------------
 def se_block(input_tensor, channels, reduction=16):
     se = layers.GlobalAveragePooling2D()(input_tensor)
@@ -63,59 +45,144 @@ def se_block(input_tensor, channels, reduction=16):
     se = layers.Reshape((1, 1, channels))(se)
     return layers.Multiply()([input_tensor, se])
 
+# -----------------------------
+# Residual Convolution Block
+# -----------------------------
+def conv_block(x, filters):
+    shortcut = x
+    x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
+    shortcut = layers.Conv2D(filters, (1, 1), padding='same')(shortcut)
+    x = layers.Add()([x, shortcut])
+    x = layers.MaxPooling2D((2, 2))(x)
+    return se_block(x, filters)
+
+# -----------------------------
+# Model Builder
+# -----------------------------
 def build_deep_model(input_shape=(224, 224, 3), num_classes=3):
     inputs = layers.Input(shape=input_shape)
-    
-    def conv_block(x, filters):
-        shortcut = x
-        x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
-        shortcut = layers.Conv2D(filters, (1, 1), padding='same')(shortcut)
-        x = layers.Add()([x, shortcut])
-        x = layers.MaxPooling2D((2, 2))(x)
-        return se_block(x, channels=filters)
-    
     x = conv_block(inputs, 64)
     x = conv_block(x, 128)
     x = conv_block(x, 256)
     x = conv_block(x, 512)
     x = conv_block(x, 512)
-    
-    x = layers.Flatten()(x)
-    x = layers.Dense(4096, activation='relu')(x)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Dense(4096, activation='relu')(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(1024, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
     outputs = layers.Dense(num_classes, activation='softmax')(x)
-    
     return models.Model(inputs, outputs)
 
 # -----------------------------
-# TensorFlow Lite Conversion
+# PCA Feature Reduction (post-CNN features)
 # -----------------------------
-def convert_to_tflite(model, quantized=False):
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    if quantized:
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    
-    file_name = "model_quant.tflite" if quantized else "model.tflite"
-    with open(file_name, "wb") as f:
-        f.write(tflite_model)
-    print(f"✅ TFLite Model Saved as {file_name}")
+def apply_pca(model, dataset):
+    feature_model = models.Model(inputs=model.input, outputs=model.layers[-3].output)
+    features = feature_model.predict(dataset)
+    pca = PCA(n_components=0.95)
+    reduced_features = pca.fit_transform(features)
+    return reduced_features, pca
 
 # -----------------------------
-# Final Execution
+# Grad-CAM & Grad-CAM++
+# -----------------------------
+def generate_gradcam_visualization(model, image_array, class_index):
+    cam = gradcam.GradCAM(model, classIdx=class_index)
+    heatmap = cam.compute_heatmap(image_array)
+    cam.overlay_heatmap(heatmap, image_array, alpha=0.5)
+
+# -----------------------------
+# Reliability Metrics
+# -----------------------------
+def compute_metrics(y_true, y_pred):
+    report = classification_report(y_true, y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    return report, kappa
+
+# -----------------------------
+# Compute FLOPs
+# -----------------------------
+def compute_flops(model):
+    concrete_func = tf.function(lambda x: model(x))
+    concrete_func = concrete_func.get_concrete_function(
+        tf.TensorSpec([1] + list(model.input_shape[1:]), model.input.dtype))
+    frozen_func = convert_variables_to_constants_v2(concrete_func)
+    graph_def = frozen_func.graph.as_graph_def()
+    flops = tf.profiler.experimental.get_stats_for_node_def(graph_def)
+    return flops
+
+# -----------------------------
+# Data Augmentation (Class-wise)
+# -----------------------------
+def get_data_generator():
+    return ImageDataGenerator(
+        rotation_range=30,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,
+        horizontal_flip=True,
+        fill_mode='nearest',
+        rescale=1./255
+    )
+
+# -----------------------------
+# Load Dataset
+# -----------------------------
+def load_dataset(data_path, batch_size=32):
+    datagen = get_data_generator()
+    return datagen.flow_from_directory(
+        data_path,
+        target_size=(224, 224),
+        batch_size=batch_size,
+        class_mode='categorical'
+    )
+
+# -----------------------------
+# Cross-Domain Evaluation
+# -----------------------------
+def cross_domain_evaluation(model, secondary_dataset):
+    results = model.evaluate(secondary_dataset)
+    print("Cross-Domain Accuracy:", results[1])
+    return results
+
+# -----------------------------
+# Model Training Pipeline
 # -----------------------------
 with strategy.scope():
     model = build_deep_model()
-    model.compile(optimizer=optimizers.Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-    
-    # Compute FLOPs and Model Parameters
-    flops = compute_flops(model)
-    total_params = model.count_params()
-    print(f"✅ Model Complexity: {total_params:,} parameters, {flops:.2f} GFLOPs")
-    
-    # Convert to TFLite
-    convert_to_tflite(model, quantized=True)
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=1e-4),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    train_dataset = load_dataset("/content/primary_dataset")
+    val_dataset = load_dataset("/content/validation_dataset")
+    secondary_dataset = load_dataset("/content/secondary_dataset")
+
+    early_stop = callbacks.EarlyStopping(patience=10, restore_best_weights=True)
+
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=100,
+        callbacks=[early_stop]
+    )
+
+    # Evaluate on secondary dataset
+    cross_domain_evaluation(model, secondary_dataset)
+
+    # Save and convert to TFLite
+    model.save("cin_grading_model.h5")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    with open("cin_model_quant.tflite", "wb") as f:
+        f.write(tflite_model)
+
+    print("✅ Model training, evaluation, and conversion complete")
+
+
