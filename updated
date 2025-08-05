@@ -1,42 +1,35 @@
 # =============================================
 # Cervical Lesion Grading using SE-Residual CNN
 # =============================================
-# Author: Your Name
-# GitHub: your_github_link
-# Description: Deep learning pipeline for CIN1-CIN3 cervical lesion classification
+# Author: Priyadarshini
+# GitHub: https://github.com/jini123/cervical-cancer-classification-colposcopy/edit/main/updated
+# Description: Deep learning pipeline for CIN1–CIN3 classification with SE blocks, PCA, class-wise augmentation,
+# interpretability, and cross-domain validation
 # =============================================
 
 import os
-import random
-import time
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, callbacks
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.decomposition import PCA
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, cohen_kappa_score
-import cv2
-import shap
-import gradcam
+from sklearn.metrics import classification_report, cohen_kappa_score
 
 # -----------------------------
-# TPU or GPU Strategy Setup
+# TPU/GPU Strategy Setup
 # -----------------------------
 try:
     tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
     tf.config.experimental_connect_to_cluster(tpu)
     tf.tpu.experimental_initialize_tpu_system(tpu)
     strategy = tf.distribute.TPUStrategy(tpu)
-    print("Running on TPU")
+    print("✅ Running on TPU")
 except:
     strategy = tf.distribute.get_strategy()
-    print("Running on CPU/GPU")
+    print("✅ Running on CPU/GPU")
 
 # -----------------------------
-# SE Block
+# Squeeze-and-Excitation Block
 # -----------------------------
 def se_block(input_tensor, channels, reduction=16):
     se = layers.GlobalAveragePooling2D()(input_tensor)
@@ -46,7 +39,7 @@ def se_block(input_tensor, channels, reduction=16):
     return layers.Multiply()([input_tensor, se])
 
 # -----------------------------
-# Residual Convolution Block
+# Residual Convolutional Block
 # -----------------------------
 def conv_block(x, filters):
     shortcut = x
@@ -59,16 +52,15 @@ def conv_block(x, filters):
     return se_block(x, filters)
 
 # -----------------------------
-# Model Builder
+# Build SE-Residual CNN Model
 # -----------------------------
-def build_deep_model(input_shape=(224, 224, 3), num_classes=3):
+def build_model(input_shape=(224, 224, 3), num_classes=3):
     inputs = layers.Input(shape=input_shape)
     x = conv_block(inputs, 64)
     x = conv_block(x, 128)
     x = conv_block(x, 256)
     x = conv_block(x, 512)
     x = conv_block(x, 512)
-
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dense(1024, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
@@ -76,106 +68,77 @@ def build_deep_model(input_shape=(224, 224, 3), num_classes=3):
     return models.Model(inputs, outputs)
 
 # -----------------------------
-# PCA Feature Reduction (post-CNN features)
+# Class-wise Data Augmentation
+# -----------------------------
+def classwise_generator(base_dir, target_size=(224, 224), batch_size=32):
+    classes = ['CIN1', 'CIN2', 'CIN3']
+    augment_config = {
+        'CIN1': dict(rotation_range=30, width_shift_range=0.3, height_shift_range=0.3, shear_range=0.3, zoom_range=0.3),
+        'CIN2': dict(rotation_range=30, width_shift_range=0.3, height_shift_range=0.3, shear_range=0.3, zoom_range=0.3),
+        'CIN3': dict(rotation_range=15, width_shift_range=0.1, height_shift_range=0.1, shear_range=0.1, zoom_range=0.1)
+    }
+    generators = []
+    for cls in classes:
+        datagen = ImageDataGenerator(rescale=1./255, horizontal_flip=True, fill_mode='nearest', **augment_config[cls])
+        gen = datagen.flow_from_directory(
+            base_dir,
+            target_size=target_size,
+            batch_size=batch_size,
+            classes=[cls],
+            class_mode='categorical',
+            shuffle=True
+        )
+        generators.append(gen)
+    return generators
+
+def mix_generators(generators):
+    while True:
+        for gen in generators:
+            yield next(gen)
+
+# -----------------------------
+# PCA Feature Reduction (Optional)
 # -----------------------------
 def apply_pca(model, dataset):
-    feature_model = models.Model(inputs=model.input, outputs=model.layers[-3].output)
-    features = feature_model.predict(dataset)
+    intermediate_model = models.Model(inputs=model.input, outputs=model.layers[-3].output)
+    features = intermediate_model.predict(dataset)
     pca = PCA(n_components=0.95)
-    reduced_features = pca.fit_transform(features)
-    return reduced_features, pca
+    reduced = pca.fit_transform(features)
+    return reduced, pca
 
 # -----------------------------
-# Grad-CAM & Grad-CAM++
+# Cross-domain Evaluation
 # -----------------------------
-def generate_gradcam_visualization(model, image_array, class_index):
-    cam = gradcam.GradCAM(model, classIdx=class_index)
-    heatmap = cam.compute_heatmap(image_array)
-    cam.overlay_heatmap(heatmap, image_array, alpha=0.5)
+def evaluate_cross_domain(model, dataset):
+    result = model.evaluate(dataset)
+    print("✅ Cross-domain Accuracy:", result[1])
 
 # -----------------------------
-# Reliability Metrics
+# Grad-CAM / Grad-CAM++ Placeholder
 # -----------------------------
-def compute_metrics(y_true, y_pred):
-    report = classification_report(y_true, y_pred)
-    kappa = cohen_kappa_score(y_true, y_pred)
-    return report, kappa
+# You can use tf-keras-vis or captum for implementation
 
 # -----------------------------
-# Compute FLOPs
-# -----------------------------
-def compute_flops(model):
-    concrete_func = tf.function(lambda x: model(x))
-    concrete_func = concrete_func.get_concrete_function(
-        tf.TensorSpec([1] + list(model.input_shape[1:]), model.input.dtype))
-    frozen_func = convert_variables_to_constants_v2(concrete_func)
-    graph_def = frozen_func.graph.as_graph_def()
-    flops = tf.profiler.experimental.get_stats_for_node_def(graph_def)
-    return flops
-
-# -----------------------------
-# Data Augmentation (Class-wise)
-# -----------------------------
-def get_data_generator():
-    return ImageDataGenerator(
-        rotation_range=30,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=0.2,
-        horizontal_flip=True,
-        fill_mode='nearest',
-        rescale=1./255
-    )
-
-# -----------------------------
-# Load Dataset
-# -----------------------------
-def load_dataset(data_path, batch_size=32):
-    datagen = get_data_generator()
-    return datagen.flow_from_directory(
-        data_path,
-        target_size=(224, 224),
-        batch_size=batch_size,
-        class_mode='categorical'
-    )
-
-# -----------------------------
-# Cross-Domain Evaluation
-# -----------------------------
-def cross_domain_evaluation(model, secondary_dataset):
-    results = model.evaluate(secondary_dataset)
-    print("Cross-Domain Accuracy:", results[1])
-    return results
-
-# -----------------------------
-# Model Training Pipeline
+# Training & TFLite Export
 # -----------------------------
 with strategy.scope():
-    model = build_deep_model()
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=1e-4),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    model = build_model()
+    model.compile(optimizer=optimizers.Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
 
-    train_dataset = load_dataset("/content/primary_dataset")
-    val_dataset = load_dataset("/content/validation_dataset")
-    secondary_dataset = load_dataset("/content/secondary_dataset")
-
-    early_stop = callbacks.EarlyStopping(patience=10, restore_best_weights=True)
+    train_gens = classwise_generator("data/primary_dataset")
+    val_gen = ImageDataGenerator(rescale=1./255).flow_from_directory("data/validation_dataset", target_size=(224, 224), batch_size=32, class_mode='categorical')
+    test_gen = ImageDataGenerator(rescale=1./255).flow_from_directory("data/secondary_dataset", target_size=(224, 224), batch_size=32, class_mode='categorical')
 
     history = model.fit(
-        train_dataset,
-        validation_data=val_dataset,
+        mix_generators(train_gens),
+        validation_data=val_gen,
+        steps_per_epoch=180,
         epochs=100,
-        callbacks=[early_stop]
+        callbacks=[callbacks.EarlyStopping(patience=10, restore_best_weights=True)]
     )
 
-    # Evaluate on secondary dataset
-    cross_domain_evaluation(model, secondary_dataset)
+    evaluate_cross_domain(model, test_gen)
 
-    # Save and convert to TFLite
     model.save("cin_grading_model.h5")
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -183,6 +146,7 @@ with strategy.scope():
     with open("cin_model_quant.tflite", "wb") as f:
         f.write(tflite_model)
 
-    print("✅ Model training, evaluation, and conversion complete")
+    print("✅ Training complete | Model saved & quantized.")
+
 
 
