@@ -1,152 +1,349 @@
 # =============================================
-# Cervical Lesion Grading using SE-Residual CNN
-# =============================================
-# Author: Priyadarshini
-# GitHub: https://github.com/jini123/cervical-cancer-classification-colposcopy/edit/main/updated
-# Description: Deep learning pipeline for CIN1–CIN3 classification with SE blocks, PCA, class-wise augmentation,
-# interpretability, and cross-domain validation
+# Cervical Lesion Grading with SE-Residual CNN
+# 10-Fold CV + Two-Phase Training + Statistics
+# TensorFlow/Keras implementation
 # =============================================
 
-import os
+import os, glob, random
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from sklearn.decomposition import PCA
-from sklearn.metrics import classification_report, cohen_kappa_score
 
-# -----------------------------
-# TPU/GPU Strategy Setup
-# -----------------------------
+# Optional (Wilcoxon). If SciPy is unavailable, script falls back to a sign test.
 try:
-    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
-    tf.config.experimental_connect_to_cluster(tpu)
-    tf.tpu.experimental_initialize_tpu_system(tpu)
-    strategy = tf.distribute.TPUStrategy(tpu)
-    print("✅ Running on TPU")
-except:
-    strategy = tf.distribute.get_strategy()
-    print("✅ Running on CPU/GPU")
+    from scipy.stats import wilcoxon
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
 
 # -----------------------------
-# Squeeze-and-Excitation Block
+# Configuration
 # -----------------------------
-def se_block(input_tensor, channels, reduction=16):
-    se = layers.GlobalAveragePooling2D()(input_tensor)
-    se = layers.Dense(channels // reduction, activation='relu')(se)
-    se = layers.Dense(channels, activation='sigmoid')(se)
-    se = layers.Reshape((1, 1, channels))(se)
-    return layers.Multiply()([input_tensor, se])
+SEED         = 42
+IMG_SIZE     = (224, 224)
+BATCH_SIZE   = 32
+N_FOLDS      = 10
+EPOCHS_INIT  = 50
+EPOCHS_FT    = 50
+LR_INIT      = 1e-4
+LR_FT        = 1e-5
+CLASSES      = ['CIN1', 'CIN2', 'CIN3']
+IMG_ROOT     = "data/images"     # <-- set to your (denoised / noisy / augmented) dataset root
+
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 
 # -----------------------------
-# Residual Convolutional Block
+# Strategy (TPU/GPU/CPU)
 # -----------------------------
-def conv_block(x, filters):
+def get_strategy():
+    try:
+        tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(tpu)
+        tf.tpu.experimental.initialize_tpu_system(tpu)
+        print("✅ Using TPU")
+        return tf.distribute.TPUStrategy(tpu)
+    except Exception:
+        strat = tf.distribute.get_strategy()
+        print("✅ Using", "GPU" if len(tf.config.list_physical_devices('GPU'))>0 else "CPU")
+        return strat
+
+STRATEGY = get_strategy()
+AUTO = tf.data.AUTOTUNE
+
+# -----------------------------
+# File listing and labels
+# -----------------------------
+def list_files_and_labels(root, classes):
+    paths, labels = [], []
+    for idx, c in enumerate(classes):
+        files = glob.glob(os.path.join(root, c, "*"))
+        files = [f for f in files if f.lower().endswith((".jpg",".jpeg",".png",".bmp",".tif",".tiff"))]
+        paths.extend(files)
+        labels.extend([idx] * len(files))
+    paths, labels = np.array(paths), np.array(labels)
+    rng = np.random.RandomState(SEED)
+    order = rng.permutation(len(paths))
+    return paths[order], labels[order]
+
+ALL_PATHS, ALL_LABELS = list_files_and_labels(IMG_ROOT, CLASSES)
+print(f"Found {len(ALL_PATHS)} images total across {len(CLASSES)} classes.")
+
+# -----------------------------
+# Data pipeline
+# -----------------------------
+def decode_img(path):
+    img = tf.io.read_file(path)
+    img = tf.image.decode_image(img, channels=3, expand_animations=False)
+    img = tf.image.convert_image_dtype(img, tf.float32)  # [0,1]
+    img = tf.image.resize(img, IMG_SIZE, method='bilinear')
+    return img
+
+# Class-aware augmentation (stronger for CIN1/CIN2 as in manuscript)
+def augment_image(img, label):
+    def aug_strong(x):
+        x = tf.image.random_flip_left_right(x)
+        x = tf.image.random_brightness(x, 0.15)
+        x = tf.image.random_contrast(x, 0.85, 1.15)
+        x = tf.keras.layers.RandomRotation(0.10)(x, training=True)
+        x = tf.keras.layers.RandomTranslation(0.20,0.20)(x, training=True)
+        x = tf.keras.layers.RandomZoom(0.20)(x, training=True)
+        x = tf.keras.layers.RandomShear(0.20,0.20)(x, training=True)
+        return x
+    def aug_light(x):
+        x = tf.image.random_flip_left_right(x)
+        x = tf.keras.layers.RandomRotation(0.05)(x, training=True)
+        x = tf.keras.layers.RandomTranslation(0.10,0.10)(x, training=True)
+        x = tf.keras.layers.RandomZoom(0.10)(x, training=True)
+        return x
+    x = tf.cond(tf.logical_or(tf.equal(label, 0), tf.equal(label, 1)),
+                lambda: aug_strong(img), lambda: aug_light(img))
+    return x, label
+
+def make_ds(paths, labels, training):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(2048, seed=SEED, reshuffle_each_iteration=True)
+    ds = ds.map(lambda p,l: (decode_img(p), tf.cast(l, tf.int32)), num_parallel_calls=AUTO)
+    if training:
+        ds = ds.map(augment_image, num_parallel_calls=AUTO)
+    ds = ds.batch(BATCH_SIZE).prefetch(AUTO)
+    return ds
+
+# -----------------------------
+# Model: SE-Residual CNN
+# -----------------------------
+def se_block(x, reduction=16):
+    channels = x.shape[-1]
+    se = tf.keras.layers.GlobalAveragePooling2D()(x)
+    se = tf.keras.layers.Dense(channels//reduction, activation='relu')(se)
+    se = tf.keras.layers.Dense(channels, activation='sigmoid')(se)
+    se = tf.keras.layers.Reshape((1,1,channels))(se)
+    return tf.keras.layers.Multiply()([x, se])
+
+def res_block(x, filters, pool=True):
     shortcut = x
-    x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(x)
-    shortcut = layers.Conv2D(filters, (1, 1), padding='same')(shortcut)
-    x = layers.Add()([x, shortcut])
-    x = layers.MaxPooling2D((2, 2))(x)
-    return se_block(x, filters)
+    y = tf.keras.layers.Conv2D(filters, 3, padding='same', activation='relu')(x)
+    y = tf.keras.layers.BatchNormalization()(y)
+    y = tf.keras.layers.Conv2D(filters, 3, padding='same', activation='relu')(y)
+    shortcut = tf.keras.layers.Conv2D(filters, 1, padding='same')(shortcut)
+    y = tf.keras.layers.Add()([y, shortcut])
+    y = se_block(y)
+    if pool:
+        y = tf.keras.layers.MaxPooling2D()(y)
+    return y
+
+def build_model(input_shape=(224,224,3), n_classes=3):
+    inp = tf.keras.Input(shape=input_shape)
+    x = res_block(inp, 64)
+    x = res_block(x, 128)
+    x = res_block(x, 256)
+    x = res_block(x, 512)
+    x = res_block(x, 512, pool=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(1024, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    out = tf.keras.layers.Dense(n_classes, activation='softmax')(x)
+    return tf.keras.Model(inp, out)
 
 # -----------------------------
-# Build SE-Residual CNN Model
+# Metrics & statistics
 # -----------------------------
-def build_model(input_shape=(224, 224, 3), num_classes=3):
-    inputs = layers.Input(shape=input_shape)
-    x = conv_block(inputs, 64)
-    x = conv_block(x, 128)
-    x = conv_block(x, 256)
-    x = conv_block(x, 512)
-    x = conv_block(x, 512)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(1024, activation='relu')(x)
-    x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
-    return models.Model(inputs, outputs)
-
-# -----------------------------
-# Class-wise Data Augmentation
-# -----------------------------
-def classwise_generator(base_dir, target_size=(224, 224), batch_size=32):
-    classes = ['CIN1', 'CIN2', 'CIN3']
-    augment_config = {
-        'CIN1': dict(rotation_range=30, width_shift_range=0.3, height_shift_range=0.3, shear_range=0.3, zoom_range=0.3),
-        'CIN2': dict(rotation_range=30, width_shift_range=0.3, height_shift_range=0.3, shear_range=0.3, zoom_range=0.3),
-        'CIN3': dict(rotation_range=15, width_shift_range=0.1, height_shift_range=0.1, shear_range=0.1, zoom_range=0.1)
-    }
-    generators = []
-    for cls in classes:
-        datagen = ImageDataGenerator(rescale=1./255, horizontal_flip=True, fill_mode='nearest', **augment_config[cls])
-        gen = datagen.flow_from_directory(
-            base_dir,
-            target_size=target_size,
-            batch_size=batch_size,
-            classes=[cls],
-            class_mode='categorical',
-            shuffle=True
-        )
-        generators.append(gen)
-    return generators
-
-def mix_generators(generators):
-    while True:
-        for gen in generators:
-            yield next(gen)
-
-# -----------------------------
-# PCA Feature Reduction (Optional)
-# -----------------------------
-def apply_pca(model, dataset):
-    intermediate_model = models.Model(inputs=model.input, outputs=model.layers[-3].output)
-    features = intermediate_model.predict(dataset)
-    pca = PCA(n_components=0.95)
-    reduced = pca.fit_transform(features)
-    return reduced, pca
-
-# -----------------------------
-# Cross-domain Evaluation
-# -----------------------------
-def evaluate_cross_domain(model, dataset):
-    result = model.evaluate(dataset)
-    print("✅ Cross-domain Accuracy:", result[1])
-
-# -----------------------------
-# Grad-CAM / Grad-CAM++ Placeholder
-# -----------------------------
-# You can use tf-keras-vis or captum for implementation
-
-# -----------------------------
-# Training & TFLite Export
-# -----------------------------
-with strategy.scope():
-    model = build_model()
-    model.compile(optimizer=optimizers.Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-
-    train_gens = classwise_generator("data/primary_dataset")
-    val_gen = ImageDataGenerator(rescale=1./255).flow_from_directory("data/validation_dataset", target_size=(224, 224), batch_size=32, class_mode='categorical')
-    test_gen = ImageDataGenerator(rescale=1./255).flow_from_directory("data/secondary_dataset", target_size=(224, 224), batch_size=32, class_mode='categorical')
-
-    history = model.fit(
-        mix_generators(train_gens),
-        validation_data=val_gen,
-        steps_per_epoch=180,
-        epochs=100,
-        callbacks=[callbacks.EarlyStopping(patience=10, restore_best_weights=True)]
+def compute_metrics(y_true, y_prob):
+    y_pred = np.argmax(y_prob, axis=1)
+    acc = accuracy_score(y_true, y_pred)
+    prec_m, rec_m, f1_m, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0,1,2], average='macro', zero_division=0
     )
+    prec_c, rec_c, f1_c, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0,1,2], average=None, zero_division=0
+    )
+    return acc, prec_m, rec_m, f1_m, prec_c, rec_c, f1_c, y_pred
 
-    evaluate_cross_domain(model, test_gen)
+def bootstrap_ci(values, n_boot=5000, alpha=0.05, seed=SEED):
+    """Nonparametric bootstrap CI for the mean of per-fold metrics."""
+    rng = np.random.default_rng(seed)
+    values = np.asarray(values, dtype=float)
+    boots = np.empty(n_boot, dtype=float)
+    n = len(values)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        boots[i] = values[idx].mean()
+    lo, hi = np.quantile(boots, [alpha/2, 1-alpha/2])
+    return float(values.mean()), float(lo), float(hi)
 
-    model.save("cin_grading_model.h5")
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    with open("cin_model_quant.tflite", "wb") as f:
-        f.write(tflite_model)
+def mcnemar_test(y_true, y_pred_a, y_pred_b):
+    """
+    Exact McNemar (binomial) on discordant pairs.
+    Returns (b, c, chi_cc, p_two_sided).
+    """
+    y_true = np.asarray(y_true)
+    a_ok = (y_pred_a == y_true)
+    b_ok = (y_pred_b == y_true)
+    b = int((~a_ok &  b_ok).sum())  # A wrong, B right
+    c = int(( a_ok & ~b_ok).sum())  # A right, B wrong
+    n = b + c
+    if n == 0:
+        return b, c, 0.0, 1.0
+    from math import comb
+    k = min(b, c)
+    tail = sum(comb(n, i) for i in range(0, k+1)) / (2**n)
+    p_two = min(1.0, 2.0*tail)
+    chi_cc = (abs(b - c) - 1)**2 / (b + c) if (b + c) > 0 else 0.0
+    return b, c, float(chi_cc), float(p_two)
 
-    print("✅ Training complete | Model saved & quantized.")
+def wilcoxon_signed_rank_test(series_a, series_b):
+    """Wilcoxon on paired per-fold metrics. Fallback to sign test if SciPy missing."""
+    a = np.asarray(series_a, dtype=float)
+    b = np.asarray(series_b, dtype=float)
+    if SCIPY_OK:
+        stat, p = wilcoxon(a, b, zero_method='wilcox', correction=False, alternative='two-sided', mode='auto')
+        return float(stat), float(p), "Wilcoxon (SciPy)"
+    # Fallback: sign test
+    from math import comb
+    diffs = a - b
+    pos = int((diffs > 0).sum())
+    neg = int((diffs < 0).sum())
+    n = pos + neg
+    if n == 0:
+        return 0.0, 1.0, "Sign test (fallback)"
+    k = min(pos, neg)
+    p_tail = sum(comb(n, i) for i in range(0, k+1)) / (2**n)
+    p_two = min(1.0, 2.0*p_tail)
+    return float(k), float(p_two), "Sign test (fallback)"
 
+# -----------------------------
+# (Optional) fold-aware PCA demo
+# -----------------------------
+def fold_pca_features(model, ds_train, ds_val, var_keep=0.95):
+    feat_extractor = tf.keras.Model(model.input, model.layers[-3].output)  # before Dropout
+    Xtr = np.concatenate([feat_extractor.predict(x, verbose=0) for x,_ in ds_train], axis=0)
+    Xva = np.concatenate([feat_extractor.predict(x, verbose=0) for x,_ in ds_val], axis=0)
+    pca = PCA(n_components=var_keep, svd_solver='full')
+    Xtr_r = pca.fit_transform(Xtr)
+    Xva_r = pca.transform(Xva)
+    return Xtr_r, Xva_r, pca
 
+# -----------------------------
+# 10-Fold CV loop (Two-phase)
+# -----------------------------
+skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+fold_results = []
+
+for fold, (idx_tr, idx_va) in enumerate(skf.split(ALL_PATHS, ALL_LABELS), start=1):
+    print(f"\n========== FOLD {fold}/{N_FOLDS} ==========")
+    tr_paths, tr_labels = ALL_PATHS[idx_tr], ALL_LABELS[idx_tr]
+    va_paths, va_labels = ALL_PATHS[idx_va], ALL_LABELS[idx_va]
+
+    ds_tr = make_ds(tr_paths, tr_labels, training=True)
+    ds_va = make_ds(va_paths, va_labels, training=False)
+
+    with STRATEGY.scope():
+        model = build_model(IMG_SIZE + (3,), n_classes=len(CLASSES))
+        model.compile(optimizer=tf.keras.optimizers.Adam(LR_INIT),
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+
+    ckpt = tf.keras.callbacks.ModelCheckpoint(
+        f"best_fold{fold}.keras", monitor='val_accuracy', save_best_only=True, mode='max', verbose=1)
+    es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, verbose=1)
+
+    # ---- Phase 1: initial training
+    model.fit(ds_tr, validation_data=ds_va, epochs=EPOCHS_INIT, callbacks=[ckpt, es], verbose=2)
+
+    # ---- Phase 2: fine-tuning (lower LR)
+    tf.keras.backend.set_value(model.optimizer.learning_rate, LR_FT)
+    es_ft = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True, verbose=1)
+    model.fit(ds_tr, validation_data=ds_va, epochs=EPOCHS_FT, callbacks=[ckpt, es_ft], verbose=2)
+
+    # Evaluate best weights
+    best = tf.keras.models.load_model(f"best_fold{fold}.keras", compile=False)
+    y_prob = np.concatenate([best.predict(x, verbose=0) for x,_ in ds_va], axis=0)
+    y_true = np.concatenate([y.numpy() for _,y in ds_va], axis=0)
+
+    acc, prec_m, rec_m, f1_m, prec_c, rec_c, f1_c, y_pred = compute_metrics(y_true, y_prob)
+    fold_results.append(dict(
+        acc=acc, prec=prec_m, rec=rec_m, f1=f1_m,
+        prec_c=prec_c, rec_c=rec_c, f1_c=f1_c
+    ))
+
+    # Save fold predictions for record (and for McNemar vs baseline)
+    np.savez(f"fold_{fold}_ours.npz", y_true=y_true, y_prob=y_prob, y_pred=y_pred, va_paths=va_paths)
+
+    print(f"[FOLD {fold}]  Acc={acc:.4f}  Macro P/R/F1 = {prec_m:.4f}/{rec_m:.4f}/{f1_m:.4f}")
+    print(f"            Class-wise F1: CIN1={f1_c[0]:.4f}  CIN2={f1_c[1]:.4f}  CIN3={f1_c[2]:.4f}")
+
+    # ----- OPTIONAL: McNemar vs baseline on this fold -----
+    # Place a file baselines/fold_{fold}_baseline.npz containing:
+    #   y_pred (int array), va_paths (to ensure sample alignment)
+    baseline_file = f"baselines/fold_{fold}_baseline.npz"
+    if os.path.exists(baseline_file):
+        base = np.load(baseline_file, allow_pickle=True)
+        y_pred_b = base["y_pred"]
+        va_paths_b = base["va_paths"]
+        # Ensure same order (recommended to store the same order)
+        if len(y_pred_b) == len(y_true) and np.all(va_paths_b == va_paths):
+            b, c, chi, p_mc = mcnemar_test(y_true, y_pred, y_pred_b)
+            print(f"            McNemar vs baseline: b={b}, c={c}, chi_cc={chi:.4f}, p={p_mc:.4g}")
+        else:
+            print("            Baseline mismatch in length or order; McNemar skipped.")
+
+# -----------------------------
+# Aggregate across folds + CIs
+# -----------------------------
+accs  = np.array([r['acc']  for r in fold_results])
+precs = np.array([r['prec'] for r in fold_results])
+recs  = np.array([r['rec']  for r in fold_results])
+f1s   = np.array([r['f1']   for r in fold_results])
+
+def print_ci(name, arr):
+    mean, lo, hi = bootstrap_ci(arr, n_boot=5000, alpha=0.05)
+    print(f"{name}: mean={mean:.4f}  95% CI=({lo:.4f}, {hi:.4f})")
+
+print("\n==== 10-Fold Cross-Validation Summary (ours) ====")
+print_ci("Accuracy", accs)
+print_ci("Macro Precision", precs)
+print_ci("Macro Recall", recs)
+print_ci("Macro F1", f1s)
+
+# -----------------------------
+# OPTIONAL: Wilcoxon vs. baseline (paired per-fold metrics)
+# Expect files baselines/fold_k_baseline_metrics.npz with keys: acc, f1
+# -----------------------------
+baseline_accs, baseline_f1s = [], []
+for fold in range(1, N_FOLDS+1):
+    p = f"baselines/fold_{fold}_baseline_metrics.npz"
+    if os.path.exists(p):
+        d = np.load(p)
+        baseline_accs.append(float(d["acc"]))
+        baseline_f1s.append(float(d["f1"]))
+
+if len(baseline_accs) == N_FOLDS:
+    stat, p, method = (wilcoxon(accs, np.array(baseline_accs)) if SCIPY_OK
+                       else (None, None, None))
+    if SCIPY_OK:
+        print(f"\nWilcoxon on Accuracy (ours vs baseline): stat={float(stat):.4f}, p={float(p):.4g}  [Wilcoxon (SciPy)]")
+        stat, p = wilcoxon(f1s, np.array(baseline_f1s))
+        print(f"Wilcoxon on Macro F1 (ours vs baseline): stat={float(stat):.4f}, p={float(p):.4g}  [Wilcoxon (SciPy)]")
+else:
+    print("\nWilcoxon: baseline per-fold metrics not found for all folds (skipped).")
+
+# -----------------------------
+# OPTIONAL: export a LaTeX summary table
+# -----------------------------
+def to_latex_avg_ci(name, arr):
+    mean, lo, hi = bootstrap_ci(arr, 5000, 0.05)
+    return f"{name} & {mean*100:.2f}\\% [{lo*100:.2f}, {hi*100:.2f}]\\\\"
+
+with open("cv_summary.tex", "w") as f:
+    f.write("\\begin{tabular}{l l}\n\\toprule\n")
+    f.write(to_latex_avg_ci("Accuracy", accs) + "\n")
+    f.write(to_latex_avg_ci("Macro Precision", precs) + "\n")
+    f.write(to_latex_avg_ci("Macro Recall", recs) + "\n")
+    f.write(to_latex_avg_ci("Macro F1", f1s) + "\n")
+    f.write("\\bottomrule\n\\end{tabular}\n")
+print("Saved LaTeX summary to cv_summary.tex")
 
